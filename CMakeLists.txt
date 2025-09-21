@@ -42,3 +42,5 @@ target_include_directories(sphere
 # openmp:llvm flag
 target_compile_options(sphere PRIVATE "/openmp:llvm")
 target_compile_definitions(sphere PRIVATE MPM_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src PREFIX "Source Files" FILES ${MPM_SRCS})
