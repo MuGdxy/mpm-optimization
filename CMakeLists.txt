@@ -24,7 +24,7 @@ find_package(libigl CONFIG REQUIRED)
 
 add_executable(sphere)
 
-file(GLOB_RECURSE MPM_SRCS "*.cpp" "*/*.cpp" "*/*.h" "*/*.hpp")
+file(GLOB_RECURSE MPM_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp")
 target_sources(sphere PRIVATE ${MPM_SRCS})
 
 # Link libraries
