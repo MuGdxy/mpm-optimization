@@ -36,7 +36,7 @@ class Solver
     ~Solver();
 
     //
-    //	Data
+    //  Data
     //
 
     std::vector<GridNode*> m_grid;
@@ -46,14 +46,14 @@ class Solver
     mcl::optlib::LBFGS<double, Eigen::Dynamic> optimizer;
 
     //
-    //	Settings
+    //  Settings
     //
 
     double                elapsed_s;
     const Eigen::Vector3d gravity = Eigen::Vector3d(0.0, -9.8, 0.0);
 
     //
-    //	Called by the gui
+    //  Called by the gui
     //
 
     // Initialize the system

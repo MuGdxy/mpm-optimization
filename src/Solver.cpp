@@ -141,6 +141,7 @@ bool Solver::step(float screen_dt)
 {
     // Compute timestep
     MPM::timestep_s = compute_timestep(screen_dt);
+    //std::cout << "Timestep: " << MPM::timestep_s << std::endl;
     MPM::clear_grid(active_grid);
 
     // Particle to grid
@@ -204,6 +205,15 @@ void Solver::explicit_solve()
 double Objective::gradient(const Eigen::VectorXd& v, Eigen::VectorXd& grad)
 {
     using namespace Eigen;
+
+    VectorXd predicted_v = v;
+    for(int i = 0; i < solver->active_grid.size(); ++i)
+    {
+        predicted_v.segment<3>(i * 3) =
+            solver->active_grid[i]->v + MPM::timestep_s * solver->gravity;
+    }
+
+    double dt         = MPM::timestep_s;
     double tot_energy = 0.0;
 
     //
@@ -215,29 +225,42 @@ double Objective::gradient(const Eigen::VectorXd& v, Eigen::VectorXd& grad)
         Particle*       p   = solver->m_particles[i];
         Eigen::Matrix3d p_F = p->get_deform_grad();
 
-        Matrix3d vel_grad;
-        vel_grad.fill(0.f);
+        Matrix3d temp_sum = Matrix3d::Zero();
 
+        // the grid nodes influenced by this particle
         std::vector<int>             grid_nodes;
         std::vector<double>          wip;
         std::vector<Eigen::Vector3d> dwip;
         MPM::make_grid_loop(p, grid_nodes, wip, dwip);
+
+        // Accumulate velocity gradient
         for(int j = 0; j < grid_nodes.size(); ++j)
         {
+            // get the active index of this grid node
+            // data is stored in the active grid
             int idx = solver->m_grid[grid_nodes[j]]->active_idx;
-            Eigen::Vector3d curr_v(v[idx * 3 + 0], v[idx * 3 + 1], v[idx * 3 + 2]);
-            vel_grad += (MPM::timestep_s * curr_v) * dwip[j].transpose();
+
+            // (v[idx * 3 + 0], v[idx * 3 + 1], v[idx * 3 + 2]);
+            Vector3d curr_v = v.segment<3>(idx * 3);
+            Vector3d dx     = MPM::timestep_s * curr_v;  // dx = dt * v
+            temp_sum += dx * dwip[j].transpose();
         }
 
-        Eigen::Matrix3d newF = (Matrix3d::Identity() + vel_grad) * p_F;  // eq 193 course notes
+        Eigen::Matrix3d newF = (Matrix3d::Identity() + temp_sum) * p_F;  // eq 193 course notes
+        // Store the stress for later
+        //tex:
+        //tempP:
+        //$$
+        // \tilde{P} = V^0_p \frac{\partial \Psi}{\partial F}(x_p) (F^n_p)^T 
+        //$$
         p->tempP = p->vol * p->get_piola_stress(newF) * p_F.transpose();
 
         // Update the total energy
-        double e   = p->get_energy_density(newF) * p->vol;
+        double e = p->get_energy_density(newF) * p->vol;
+
         tot_energy = tot_energy + e;
 
     }  // end loop particles
-
 
     //
     //	Compute energy gradient
@@ -245,22 +268,24 @@ double Objective::gradient(const Eigen::VectorXd& v, Eigen::VectorXd& grad)
 #pragma omp parallel for reduction(+ : tot_energy)
     for(int i = 0; i < solver->active_grid.size(); ++i)
     {
-        GridNode*       node = solver->active_grid[i];
-        Eigen::Vector3d curr_v(v[i * 3 + 0], v[i * 3 + 1], v[i * 3 + 2]);
+        GridNode*       node   = solver->active_grid[i];
+        Eigen::Vector3d curr_v = v.segment<3>(i * 3);
+        Eigen::Vector3d pred_v = predicted_v.segment<3>(i * 3);
 
-        Eigen::Vector3d momentum_grad = node->m * (curr_v - node->v);
+        Eigen::Vector3d momentum_grad = node->m * (curr_v - pred_v);
         Eigen::Vector3d energy_grad(0, 0, 0);
 
         for(int j = 0; j < node->particles.size(); ++j)
         {
-            energy_grad += node->particles[j]->tempP * node->dwip[j] * MPM::timestep_s;
+
+            energy_grad += (node->particles[j]->tempP) * node->dwip[j] * dt;
         }
 
         if(grad.rows() == v.rows())
         {
             grad.segment(i * 3, 3) = momentum_grad + energy_grad;
         }
-        tot_energy = tot_energy + 0.5 * node->m * (curr_v - node->v).squaredNorm();
+        tot_energy = tot_energy + 0.5 * node->m * (curr_v - pred_v).squaredNorm();
 
     }  // end loop grid
 
@@ -277,10 +302,7 @@ void Solver::implicit_solve()
 #pragma omp parallel for
     for(int i = 0; i < active_grid.size(); ++i)
     {
-        for(int j = 0; j < 3; ++j)
-        {
-            v[i * 3 + j] = active_grid[i]->v[j];
-        }
+        v.segment<3>(i * 3) = active_grid[i]->v;
     }
 
     // Minimize
@@ -291,11 +313,7 @@ void Solver::implicit_solve()
 #pragma omp parallel for
     for(int i = 0; i < active_grid.size(); ++i)
     {
-        for(int j = 0; j < 3; ++j)
-        {
-            active_grid[i]->v[j] = v[i * 3 + j];
-        }
-        active_grid[i]->v += MPM::timestep_s * gravity;  // explicitly add gravity
+        active_grid[i]->v = v.segment<3>(i * 3);
     }
 
 }  // end implicit solve

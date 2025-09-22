@@ -82,29 +82,40 @@ void MPM::p2g_mass(std::vector<Particle*>& particles,
     using namespace Eigen;
 
 #pragma omp parallel for
-    for(int i = 0; i < particles.size(); ++i)
+    // p is for particle index
+    for(int p = 0; p < particles.size(); ++p)
     {
-        Particle* p = particles[i];
-        p->D.setZero();
+        Particle* P = particles[p];
+        P->D.setZero();
 
+        // the grid nodes influnced by this particle
         std::vector<int>             grid_nodes;
-        std::vector<double>          wip;
-        std::vector<Eigen::Vector3d> dwip;
-        MPM::make_grid_loop(p, grid_nodes, wip, dwip);
-        for(int j = 0; j < grid_nodes.size(); ++j)
+        std::vector<double>          _wip;
+        std::vector<Eigen::Vector3d> _dwip;
+        MPM::make_grid_loop(P, grid_nodes, _wip, _dwip);
+
+        for(int k = 0; k < grid_nodes.size(); ++k)
         {
+            int      i    = grid_nodes[k];
+            double   wip  = _wip[k];
+            Vector3d dwip = _dwip[k];
+
             // Compute helper matrix
-            Eigen::Vector3d xixp = xi_xp(grid_nodes[j], p);
-            p->D += wip[j] * (xixp) * (xixp).transpose();  // eq 174 course notes
+            Eigen::Vector3d xixp = xi_xp(grid_nodes[k], P);
+            P->D += wip * (xixp) * (xixp).transpose();  // eq 174 course notes
 
             // Atomics are bad and all, but this way works fine for now.
 #pragma omp critical
             {  // add mass to grid
-                int grid_idx = grid_nodes[j];
-                grid[grid_idx]->m += wip[j] * p->m;
-                grid[grid_idx]->particles.push_back(p);
-                grid[grid_idx]->wip.push_back(wip[j]);
-                grid[grid_idx]->dwip.push_back(dwip[j]);
+                int   grid_idx = grid_nodes[k];
+                auto& mi       = grid[grid_idx]->m;
+                auto& mp       = P->m;
+
+                mi += wip * mp;  // eq 173 course notes
+
+                grid[grid_idx]->particles.push_back(P);
+                grid[grid_idx]->wip.push_back(wip);
+                grid[grid_idx]->dwip.push_back(dwip);
             }
 
         }  // end loop grid nodes
@@ -165,24 +176,31 @@ void MPM::p2g_velocity(const std::vector<Particle*>& particles,
 #pragma omp parallel for
     for(int i = 0; i < active_grid.size(); ++i)
     {
-        Eigen::Vector3i gridx = MPM::grid_pos(active_grid[i]->global_idx);
+        auto&           cur_grid = active_grid[i];
+        Eigen::Vector3i gridx    = MPM::grid_pos(cur_grid->global_idx);
 
-        for(int j = 0; j < active_grid[i]->particles.size(); ++j)
+
+        for(int j = 0; j < cur_grid->particles.size(); ++j)
         {
-            Particle* p      = active_grid[i]->particles[j];
+            Particle* p      = cur_grid->particles[j];
             Matrix3d  Dp_inv = p->D.inverse();
 
-            Vector3d xixp(gridx[0] * cellsize[0] - p->x[0],
-                          gridx[1] * cellsize[1] - p->x[1],
-                          gridx[2] * cellsize[2] - p->x[2]);
-            Vector3d newv = p->v + p->B * Dp_inv * (xixp);
-            active_grid[i]->v += active_grid[i]->wip[j] * p->m * newv;  // eq 173 course notes
+            Vector3d xi = gridx.cast<double>().array() * cellsize.array();
+
+            const Vector3d& xp  = p->x;
+            const Vector3d& vp  = p->v;
+            const Matrix3d& Bp  = p->B;
+            double          mp  = p->m;
+            double          wip = cur_grid->wip[j];
+            // alias (reuse v as mv)
+            Vector3d& mivi = cur_grid->v;
+            mivi += wip * mp * (vp + Bp * Dp_inv * (xi - xp));  // eq 173 course notes
 
         }  // end loop neighborhood
 
         // Fix Velocity (remove mass)
-        assert(active_grid[i]->m > 0.0);
-        active_grid[i]->v /= active_grid[i]->m;
+        assert(cur_grid->m > 0.0);
+        cur_grid->v /= cur_grid->m;
 
     }  // end loop grid
 
@@ -249,7 +267,6 @@ void MPM::g2p_velocity(std::vector<Particle*>& particles, const std::vector<Grid
             Eigen::Vector3d xixp = xi_xp(grid_nodes[j], p);
             p->B += wip[j] * grid[grid_nodes[j]]->v * xixp.transpose();  // eq 176 course notes
         }
-
     }  // end loop particles
 
 }  // end grid to particle velocity
@@ -310,6 +327,8 @@ void MPM::make_grid_loop(const Particle*               p,
                          std::vector<double>&          Wip,
                          std::vector<Eigen::Vector3d>& dWip)
 {
+    using namespace Eigen;
+
     grid_idx.clear();
     Wip.clear();
     dWip.clear();
@@ -318,61 +337,62 @@ void MPM::make_grid_loop(const Particle*               p,
     dWip.reserve(64);
 
     // Our smoothing kernel has a radius of 2: 64 nodes 3D
-    Eigen::Vector3i normed_x = Eigen::Vector3i(
-        p->x[0] / cellsize[0], p->x[1] / cellsize[1], p->x[2] / cellsize[2]);
-    Eigen::Vector3i ll_idx = normed_x - Eigen::Vector3i(1, 1, 1);  // get the lowest-left index
+    Vector3i normed_x = (p->x.array() / cellsize.array()).cast<int>();
+
+    Vector3i ll_idx = normed_x - Vector3i::Ones();  // get the lowest-left index
 
     for(int x = ll_idx[0]; x < (ll_idx[0] + 4); ++x)
-    {
-        double wx_x   = p->x[0] / cellsize[0] - double(x);
-        double wip_x  = qspline(wx_x);
-        double dwip_x = d_qspline(wx_x);
-
         for(int y = ll_idx[1]; y < (ll_idx[1] + 4); ++y)
-        {
-            double wy_x   = p->x[1] / cellsize[1] - double(y);
-            double wip_y  = qspline(wy_x);
-            double dwip_y = d_qspline(wy_x);
-
             for(int z = ll_idx[2]; z < (ll_idx[2] + 4); ++z)
             {
-                double wz_x   = p->x[2] / cellsize[2] - double(z);
-                double wip_z  = qspline(wz_x);
-                double dwip_z = d_qspline(wz_x);
-
                 // Compute grid index and interpolation weights
-                int    g_idx = grid_index(Eigen::Vector3i(x, y, z));
-                double g_wip = wip_x * wip_y * wip_z;
-                Eigen::Vector3d g_dwip((1.0 / cellsize[0]) * dwip_x * wip_y * wip_z,
-                                       wip_x * (1.0 / cellsize[1]) * dwip_y * wip_z,
-                                       wip_x * wip_y * (1.0 / cellsize[2]) * dwip_z);  // eq (after) 124 course notes
-
+                int g_idx = grid_index(Vector3i(x, y, z));
                 // Check that the computed node is within the grid boundaries.
                 // Near the edges it may not be (if something went wrong with collision).
-                if(g_idx < 0 || g_idx > gridsize[0] * gridsize[1] * gridsize[2] - 1
-                   || g_wip < 0.0)
+                if(g_idx < 0 || g_idx > gridsize[0] * gridsize[1] * gridsize[2] - 1)
                 {
                     continue;
                 }
+
+                double wx_x   = p->x[0] / cellsize[0] - double(x);
+                double wip_x  = qspline(wx_x);
+                double dwip_x = d_qspline(wx_x);
+
+                double wy_x   = p->x[1] / cellsize[1] - double(y);
+                double wip_y  = qspline(wy_x);
+                double dwip_y = d_qspline(wy_x);
+
+                double wz_x   = p->x[2] / cellsize[2] - double(z);
+                double wip_z  = qspline(wz_x);
+                double dwip_z = d_qspline(wz_x);
+                double g_wip  = wip_x * wip_y * wip_z;
+
+                if(g_wip < 0.0)
+                {
+                    continue;
+                }
+
+                // eq (after) 124 course notes
+                Eigen::Vector3d g_dwip;
+                g_dwip.x() = (1.0 / cellsize[0]) * dwip_x * wip_y * wip_z;
+                g_dwip.y() = wip_x * (1.0 / cellsize[1]) * dwip_y * wip_z;
+                g_dwip.z() = wip_x * wip_y * (1.0 / cellsize[2]) * dwip_z;
 
                 // All good, add it to the vectors
                 grid_idx.push_back(g_idx);
                 Wip.push_back(g_wip);
                 dWip.push_back(g_dwip);
-
-            }  // end loop z
-        }      // end loop y
-    }          // end loop x
+            }
 
 }  // end make grid loop
 
 
 Eigen::Vector3d MPM::xi_xp(const int grid_idx, const Particle* p)
 {
-    Eigen::Vector3i gridx = grid_pos(grid_idx);
-    Eigen::Vector3d xixp(double(gridx[0]) * cellsize[0] - p->x[0],
-                         double(gridx[1]) * cellsize[1] - p->x[1],
-                         double(gridx[2]) * cellsize[2] - p->x[2]);
+    Eigen::Vector3i        gridx = grid_pos(grid_idx);
+    Eigen::Vector3d        xi = gridx.cast<double>().array() * cellsize.array();
+    const Eigen::Vector3d& xp = p->x;
+    Eigen::Vector3d        xixp = xi - xp;
     return xixp;
 }  // end compute world coord diff
 
