@@ -21,7 +21,6 @@
 #define MPM_BASE_HPP 1
 
 #include "Particle.hpp"
-#include <unordered_map>
 
 namespace mpm
 {
